@@ -1,0 +1,792 @@
+---
+title: "SMGA_v2"
+author: "Noah Hagaseth"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+
+# ---- For general data handling ----
+library(tidyverse)
+
+# ---- For creation of heatmap ----
+library(pheatmap)
+
+# ---- For phylogenetic tree ----
+library(ggtree)
+library(tidytree)
+library(ggtreeExtra)
+library(ape)
+library(paletteer)
+library(ggstar)
+library(ggnewscale)
+
+# ---- For GIFT/MCI ----
+library(distillR)
+library(viridis)
+library(Polychrome)
+library(Rtsne)
+
+
+```
+
+
+```{r Nanoplot comparison}
+
+
+# ---- Function to import and format NanoStats.txt ----
+
+read_nanostats <- function(file, sample, status) {
+  lines <- readLines(file)
+
+  tibble(
+    Sample = sample,
+    Status = status,
+    Metric = c(
+      "Mean read length",
+      "Mean read quality",
+      "Number of reads",
+      "Read length N50"
+    ),
+    Value = c(
+      as.numeric(str_extract(lines[grep("Mean read length", lines)], "[0-9,.]+") |> str_remove_all(",")),
+      as.numeric(str_extract(lines[grep("Mean read quality", lines)], "[0-9,.]+")),
+      as.numeric(str_extract(lines[grep("Number of reads", lines)], "[0-9,.]+") |> str_remove_all(",")),
+      as.numeric(str_extract(lines[grep("Read length N50", lines)], "[0-9,.]+") |> str_remove_all(","))
+    )
+  )
+}
+
+# ---- Import all NanoStats files ----
+
+nanostats <- bind_rows(
+  read_nanostats("NanoStatsMucus.txt",        "Mucus", "Raw"),
+  read_nanostats("NanoStatsMucusClean.txt",   "Mucus", "Filtered"),
+  read_nanostats("NanoStatsSalt.txt",         "Saltwater", "Raw"),
+  read_nanostats("NanoStatsSaltClean.txt",    "Saltwater", "Filtered"),
+  read_nanostats("NanoStatsFresh.txt",        "Freshwater", "Raw"),
+  read_nanostats("NanoStatsFreshClean.txt",   "Freshwater", "Filtered")
+)
+
+# ---- Ensure correct factor order ----
+
+nanostats <- nanostats %>%
+  mutate(
+    Status = factor(Status, levels = c("Raw", "Filtered")),
+    Metric = factor(
+      Metric,
+      levels = c(
+        "Mean read length",
+        "Read length N50",
+        "Mean read quality",
+        "Number of reads"
+      )
+    ),
+    Sample = factor(
+      Sample,
+      levels = c("Mucus", "Freshwater", "Saltwater")
+    )
+  )
+
+# ---- Plot ----
+
+ggplot(nanostats,
+       aes(x = Sample, y = Value, fill = Status)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+  facet_wrap(~ Metric, scales = "free_y") +
+  labs(
+    title = "NanoPlot Metrics Before VS After Filtering",
+    x = "",
+    y = ""
+  ) +
+  scale_fill_manual(values = c("darkblue", "skyblue")) +
+  theme_bw(base_size = 12) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold", hjust = 0.5))
+
+
+```
+
+
+```{r Import polish assembly data}
+
+# ---- Function to import and format assembly.metrics output ----
+
+read_and_tidy <- function(filename, treatment_name) {
+  read_tsv(filename, show_col_types = FALSE) %>%
+    mutate(Treatment = treatment_name) %>%
+    pivot_longer(
+      cols = -c(filename, Treatment),
+      names_to = "Metric",
+      values_to = "Value"
+    ) %>%
+    mutate(
+      Assembly = case_when(
+        str_detect(filename, regex("flye", ignore_case = TRUE)) ~ "Flye",
+        str_detect(filename, regex("medaka", ignore_case = TRUE)) ~ "Medaka",
+        TRUE ~ filename
+      )
+    )
+}
+
+# ---- Import assembly data ---
+
+salt_assembly_df  <- read_and_tidy("Flye.Medaka.salt.tsv",  "Saltwater")
+mucus_assembly_df <- read_and_tidy("Flye.Medaka.mucus.tsv", "Mucus")
+fresh_assembly_df <- read_and_tidy("Flye.Medaka.fresh.tsv", "Freshwater")
+
+# ---- Combine and filter data ---
+
+all_assemblies <- bind_rows(salt_assembly_df, mucus_assembly_df, fresh_assembly_df) %>%
+  filter(Metric %in% c("total_length", "mean_length", "N50", "N90")) %>% 
+  filter(Assembly %in% "Medaka")
+
+
+
+```
+
+
+```{r Kraken Heatmap}
+
+# ---- Import kraken2 data ----
+
+salt_kraken <- read_tsv("saltwater.kraken2.report.tsv", col_names = FALSE)
+fresh_kraken <- read_tsv("freshwater.kraken2.report.tsv", col_names = FALSE)
+mucus_kraken <- read_tsv("mucus.kraken2.report.tsv", col_names = FALSE)
+
+colnames(salt_kraken)  <- c("perc", "reads_clade", "reads_direct", "rank", "taxid", "name")
+colnames(fresh_kraken) <- colnames(salt_kraken)
+colnames(mucus_kraken) <- colnames(salt_kraken)
+
+
+# ---- Function to filter kraken2 data ----
+
+filter_bacteria <- function(df) {
+  bac_idx <- which(df$taxid == 2)
+  
+  if (length(bac_idx) == 0) return(df %>% filter(rank == "S" & perc > 0.5))
+  
+  domain_indices <- which(df$rank == "D")
+  next_domain <- domain_indices[domain_indices > bac_idx][1]
+  
+  if (is.na(next_domain)) {
+    bacterial_rows <- df[bac_idx:nrow(df), ]
+  } else {
+    bacterial_rows <- df[bac_idx:(next_domain - 1), ]
+  }
+  
+  bacterial_rows %>%
+    filter(rank == "S" & perc > 0.5)
+}
+
+# ---- Filtering and combining genus data ----
+
+salt_genus_filter <- filter_bacteria(salt_kraken) %>%
+  mutate(Genus = word(name, 1)) %>%
+  group_by(Genus) %>%
+  summarise(reads_clade = sum(reads_clade), .groups = "drop")
+
+fresh_genus_filter <- filter_bacteria(fresh_kraken) %>%
+  mutate(Genus = word(name, 1)) %>%
+  group_by(Genus) %>%
+  summarise(reads_clade = sum(reads_clade), .groups = "drop")
+
+mucus_genus_filter <- filter_bacteria(mucus_kraken) %>%
+  mutate(Genus = word(name, 1)) %>%
+  group_by(Genus) %>%
+  summarise(reads_clade = sum(reads_clade), .groups = "drop")
+
+all_genus_filtered <- unique(c(salt_genus_filter$Genus,
+                      fresh_genus_filter$Genus,
+                      mucus_genus_filter$Genus))
+
+# ---- Creating abundance matrix ----
+
+abundance_matrix_genus_filter <- data.frame(
+  Genus = all_genus_filtered,
+  Mucus = mucus_genus_filter$reads_clade[match(all_genus_filtered, mucus_genus_filter$Genus)],
+  Freshwater = fresh_genus_filter$reads_clade[match(all_genus_filtered, fresh_genus_filter$Genus)],
+  Saltwater = salt_genus_filter$reads_clade[match(all_genus_filtered, salt_genus_filter$Genus)]
+)
+
+abundance_matrix_genus_filter[is.na(abundance_matrix_genus_filter)] <- 0
+
+rownames(abundance_matrix_genus_filter) <- abundance_matrix_genus_filter$Genus
+abundance_matrix_genus_filter$Genus <- NULL
+
+# ---- Creating heatmap ----
+
+pheatmap(abundance_matrix_genus_filter,
+         cluster_rows = TRUE,
+         cluster_cols = FALSE,
+         scale = "row",
+         color = rev(hcl.colors(500, "Purples 3")),
+         show_colnames = TRUE,
+         angle_col = 0)
+
+```
+
+
+```{r For MAG table}
+
+# ---- Function to import and format GTDBTK data ----
+parse_gtdb <- function(file, treatment_name) {
+  
+  read_tsv(file, show_col_types = FALSE) %>%
+    
+    select(user_genome, classification) %>%
+    
+    separate(classification,
+             into = c("Domain","Phylum","Class","Order",
+                      "Family","Genus","Species"),
+             sep = ";",
+             fill = "right") %>%
+    
+    mutate(across(Domain:Species,
+                  ~ str_remove(.x, "^[a-z]__"))) %>%
+    
+    mutate(Treatment = treatment_name) %>%
+    
+    rename(MAG = user_genome)
+}
+
+# ---- Importing GTDBTK data ----
+
+salt_tbl  <- parse_gtdb("gtdbtk.salt.summary.tsv",  "Saltwater")
+fresh_tbl <- parse_gtdb("gtdbtk.fresh.summary.tsv", "Freshwater")
+mucus_tbl <- parse_gtdb("gtdbtk.mucus.summary.tsv", "Mucus")
+
+gtdb_overview <- bind_rows(salt_tbl, fresh_tbl, mucus_tbl)
+
+gtdb_overview$Species[gtdb_overview$Species == ""] <- NA
+
+gtdb_overview <- gtdb_overview %>%
+  mutate(Genus = str_remove(Genus, "_[A-Z]$"))
+
+# ---- Keeping only dereplicated MAGs ----
+
+keep_paths <- c(
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Saltwater/drep2/saltwater.DREP.70.5.out/dereplicated_genomes/saltwater.medaka.dir.Metabat2.2.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Saltwater/drep2/saltwater.DREP.70.5.out/dereplicated_genomes/saltwater.medaka.dir.Metabat2.4.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Saltwater/drep2/saltwater.DREP.70.5.out/dereplicated_genomes/saltwater.medaka.dir.Metabat2.5.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Mucus/drep2/mucus.DREP.70.5.out/dereplicated_genomes/mucus.medaka.dir.MaxBin.out.005.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Mucus/drep2/mucus.DREP.70.5.out/dereplicated_genomes/mucus.medaka.dir.MaxBin.out.006.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Mucus/drep2/mucus.DREP.70.5.out/dereplicated_genomes/mucus.medaka.dir.MaxBin.out.009.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Mucus/drep2/mucus.DREP.70.5.out/dereplicated_genomes/mucus.medaka.dir.MaxBin.out.010.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Mucus/drep2/mucus.DREP.70.5.out/dereplicated_genomes/mucus.medaka.dir.MaxBin.out.014.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Mucus/drep2/mucus.DREP.70.5.out/dereplicated_genomes/mucus.medaka.dir.MaxBin.out.015.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Mucus/drep2/mucus.DREP.70.5.out/dereplicated_genomes/mucus.medaka.dir.Metabat2.1.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Mucus/drep2/mucus.DREP.70.5.out/dereplicated_genomes/mucus.medaka.dir.Metabat2.5.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Mucus/drep2/mucus.DREP.70.5.out/dereplicated_genomes/mucus.medaka.dir.Metabat2.6.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Mucus/drep2/mucus.DREP.70.5.out/dereplicated_genomes/mucus.medaka.dir.Metabat2.7.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Mucus/drep2/mucus.DREP.70.5.out/dereplicated_genomes/mucus.medaka.dir.Metabat2.9.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Mucus/drep2/mucus.DREP.70.5.out/dereplicated_genomes/mucus.medaka.dir.Metabat2.11.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Mucus/drep2/mucus.DREP.70.5.out/dereplicated_genomes/mucus.medaka.dir.Metabat2.13.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Mucus/drep2/mucus.DREP.70.5.out/dereplicated_genomes/mucus.medaka.dir.Metabat2.14.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Mucus/drep2/mucus.DREP.70.5.out/dereplicated_genomes/mucus.medaka.dir.Metabat2.16.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Mucus/drep2/mucus.DREP.70.5.out/dereplicated_genomes/mucus.medaka.dir.Metabat2.17.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Mucus/drep2/mucus.DREP.70.5.out/dereplicated_genomes/mucus.medaka.dir.Metabat2.26.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Freshwater/drep2/freshwater.DREP.70.5.out/dereplicated_genomes/freshwater.medaka.dir.MaxBin.out.002.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Freshwater/drep2/freshwater.DREP.70.5.out/dereplicated_genomes/freshwater.medaka.dir.MaxBin.out.004.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Freshwater/drep2/freshwater.DREP.70.5.out/dereplicated_genomes/freshwater.medaka.dir.MaxBin.out.005.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Freshwater/drep2/freshwater.DREP.70.5.out/dereplicated_genomes/freshwater.medaka.dir.MaxBin.out.008.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Freshwater/drep2/freshwater.DREP.70.5.out/dereplicated_genomes/freshwater.medaka.dir.MaxBin.out.009.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Freshwater/drep2/freshwater.DREP.70.5.out/dereplicated_genomes/freshwater.medaka.dir.MaxBin.out.012.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Freshwater/drep2/freshwater.DREP.70.5.out/dereplicated_genomes/freshwater.medaka.dir.MaxBin.out.013.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Freshwater/drep2/freshwater.DREP.70.5.out/dereplicated_genomes/freshwater.medaka.dir.Metabat2.3.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Freshwater/drep2/freshwater.DREP.70.5.out/dereplicated_genomes/freshwater.medaka.dir.Metabat2.7.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Freshwater/drep2/freshwater.DREP.70.5.out/dereplicated_genomes/freshwater.medaka.dir.Metabat2.20.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Freshwater/drep2/freshwater.DREP.70.5.out/dereplicated_genomes/freshwater.medaka.dir.Metabat2.29.fasta",
+  "/mnt/project/sandvelab/SMGA_v_2.0/people/Noah/Freshwater/drep2/freshwater.DREP.70.5.out/dereplicated_genomes/freshwater.medaka.dir.Metabat2.34.fasta"
+)
+
+keep_bins <- basename(keep_paths)
+
+
+# ---- Function to import and format assembly.metric output of MAGs ----
+
+read_and_tidy_mags <- function(filename, treatment_name) {
+  read_tsv(filename, show_col_types = FALSE) %>%
+    mutate(Treatment = treatment_name)
+}
+
+# ---- Importing and combining MAG metrics
+
+salt_mag_df  <- read_and_tidy_mags("salt.bins.qc.tsv",  "Saltwater")
+mucus_mag_df <- read_and_tidy_mags("mucus.bins.qc.tsv", "Mucus")
+fresh_mag_df <- read_and_tidy_mags("freshwater.bins.qc.tsv", "Freshwater")
+
+all_mag_df <- bind_rows(salt_mag_df, mucus_mag_df, fresh_mag_df)
+
+all_mag_df <- all_mag_df %>%
+  mutate(bin_name = basename(filename))
+
+# ---- Filtering for dereplicated MAGs ----
+
+all_mag_df_filtered <- all_mag_df %>%
+  filter(bin_name %in% keep_bins)
+
+```
+
+
+
+
+```{r Phylogenetic tree}
+
+# ---- Combine GTDB-Tk summaries ----
+gtdb_combined <- bind_rows(
+  read.table("gtdbtk.salt.summary.tsv",  sep="\t", header=TRUE, stringsAsFactors=FALSE, colClasses="character"),
+  read.table("gtdbtk.mucus.summary.tsv", sep="\t", header=TRUE, stringsAsFactors=FALSE, colClasses="character"),
+  read.table("gtdbtk.fresh.summary.tsv", sep="\t", header=TRUE, stringsAsFactors=FALSE, colClasses="character")
+)
+
+write.table(gtdb_combined, "gtdbtk.combined.summary.tsv", sep="\t", row.names=FALSE, quote=FALSE)
+
+# ---- Combine quality reports ----
+quality_combined <- bind_rows(
+  read.table("quality_report_salt.tsv",  sep="\t", header=TRUE, stringsAsFactors=FALSE, colClasses="character"),
+  read.table("quality_report_fresh.tsv", sep="\t", header=TRUE, stringsAsFactors=FALSE, colClasses="character"),
+  read.table("quality_report_mucus.tsv", sep="\t", header=TRUE, stringsAsFactors=FALSE, colClasses="character")
+)
+
+write.table(quality_combined, "quality_report_combined.tsv", sep="\t", row.names=FALSE, quote=FALSE)
+
+# ---- File paths ----
+
+CHECK <- "quality_report_combined.tsv"
+BAC   <- "gtdbtk.combined.summary.tsv"
+TREE  <- "protein_files_combined.tre"
+OUT   <- "phylo_tre_final"
+
+# ---- Read CheckM quality report ----
+
+print("Reading checkM....")
+
+CheckM <- read_tsv(CHECK) %>%
+  dplyr::select(matches("Name|Completeness|Contamination|Total_Contigs")) %>%
+  dplyr::rename("Bin_Id" = Name) %>%
+  rename_all(., ~str_replace_all(., " ", "_")) %>%
+  mutate(Genome = str_remove_all(Bin_Id, ".fasta$")) %>%
+  select(Genome, everything())
+
+
+# ---- Load 16S rRNA data ----
+
+print("Loading 16S rRNA data....")
+
+rRNA_16S <- bind_rows(
+  read_tsv("salt_genome_stats.tsv"),
+  read_tsv("mucus_genome_stats.tsv"),
+  read_tsv("fresh_genome_stats.tsv")
+) %>%
+  rename("Genome"  = "genome",            
+         "rRNA16S_count" = `16S rRNA`) %>%
+  mutate(rRNA16S = if_else(rRNA16S_count > 0, "Present", "Absent")) %>%
+  select(Genome, rRNA16S)
+
+# ---- Read GTDBTK taxonomy data ----
+
+print("Reading GTDBTk....")
+
+gtdbtkBac <- read_tsv(BAC) %>%
+  dplyr::select(user_genome, classification) %>%
+  rename("Genome" = user_genome) %>%
+  mutate(Treatment = stringr::str_extract(Genome, "^[^.]+"),
+         Treatment = factor(Treatment,
+                       levels = c("mucus", "freshwater", "saltwater"))
+  )
+
+GTDBTKTotal <- gtdbtkBac
+
+# ---- Merge CheckM and GTDBTK data ---
+
+GenoTaxoInfo <- GTDBTKTotal %>%
+  left_join(CheckM, by = "Genome")
+
+# ---- Tidy taxonomy — split classification string into readable columns ----
+
+GenoTaxoInfo <- GenoTaxoInfo %>%
+  select(Bin_Id,
+         Genome,
+         Treatment,
+         classification,
+         Completeness,
+         Contamination,
+         Total_Contigs) %>%
+  separate(classification, sep = ";",
+           into = c("D", "P", "C", "O", "Fa", "G", "S"),
+           remove = FALSE) %>%
+  mutate_at(.vars = vars(S),
+            .funs = ~ str_remove(., pattern = ".*[[:space:]]")) %>%
+  mutate_at(.vars = vars(S),
+            .funs = ~ str_remove(., pattern = "(?<=sp)\\d.*")) %>%
+  mutate_at(.vars = vars(D),
+            .funs = ~ str_remove_all(., pattern = ".*d__")) %>%
+  mutate_at(.vars = vars(P),
+            .funs = ~ str_remove_all(., pattern = ".*p__")) %>%
+  mutate_at(.vars = vars(C),
+            .funs = ~ str_remove_all(., pattern = ".*c__")) %>%
+  mutate_at(.vars = vars(O),
+            .funs = ~ str_remove_all(., pattern = ".*o__")) %>%
+  mutate_at(.vars = vars(Fa),
+            .funs = ~ str_remove_all(., pattern = ".*f__")) %>%
+  mutate_at(.vars = vars(G),
+            .funs = ~ str_remove_all(., pattern = ".*g__")) %>%
+  mutate_at(.vars = vars(S),
+            .funs = ~ str_remove_all(., pattern = ".*s__")) %>%
+  mutate_at(.vars = vars(D, P, C, O, Fa, G, S),
+            .funs = ~ str_remove_all(., pattern = "_..*")) %>%
+  mutate_at(.vars = vars(D, P, C, O, Fa, G, S),
+            .funs = ~ str_replace(., pattern = "^$", replacement = ";")) %>%
+  unite("classification", D:P:C:O:Fa:G:S, sep = "_") %>%
+  mutate_at(.vars = vars(classification),
+            .funs = ~ str_replace(., pattern = "_;.*", replacement = "")) %>%
+  separate(classification, sep = "_",
+           remove = FALSE,
+           into = c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species")) %>%
+  mutate(Genus = coalesce(Genus, Order)) %>%
+  dplyr::arrange(Phylum)
+
+# ---- Add circularity info ----
+
+circular_mags <- c(
+  "mucus.medaka.dir.Metabat2.1",
+  "mucus.medaka.dir.Metabat2.11",
+  "mucus.medaka.dir.Metabat2.16",
+  "mucus.medaka.dir.Metabat2.17",
+  "mucus.medaka.dir.Metabat2.6",
+  "mucus.medaka.dir.Metabat2.7",
+  "mucus.medaka.dir.Metabat2.9",
+  "freshwater.medaka.dir.MaxBin.out.008",
+  "freshwater.medaka.dir.Metabat2.29",
+  "freshwater.medaka.dir.Metabat2.34",
+  "freshwater.medaka.dir.Metabat2.7",
+  "saltwater.medaka.dir.Metabat2.2"
+)
+
+GenoTaxoInfo <- GenoTaxoInfo %>%
+  mutate(CircularMAG = if_else(Genome %in% circular_mags,
+                               "Yes",
+                               NA_character_))
+
+# ---- Add 16S rRNA data to GenoTaxoInfo ----
+
+
+GenoTaxoInfo <- GenoTaxoInfo %>%
+  left_join(rRNA_16S, by = "Genome")
+
+# ---- Read phylogenetic tree ----
+
+print("Reading tree...")
+
+Tree <- read.tree(TREE)
+
+# ---- Group by domain ----
+
+Domains <- GenoTaxoInfo %>%
+  group_by(Domain) %>%
+  summarise(Bin_Id = paste(Bin_Id, collapse = ","))
+
+Dom <- map(Domains$Bin_Id, function(x){
+  unlist(strsplit(x, split = ","))
+})
+
+names(Dom) <- Domains$Domain
+
+# ---- Plotting tree coloured by domain ----
+
+print("Plotting tree...")
+
+GG <- groupOTU(Tree, Dom, "Domain")
+
+GGT <- ggtree(GG,
+              layout = "fan",
+              open.angle = 12,
+              size = 0.3) %<+% GenoTaxoInfo +
+  aes(color = Domain.x) +
+  scale_color_brewer(palette = "Set2",
+                     name = "Domain") +
+  geom_treescale(fontsize = 3)
+
+# ---- Order colour palette ----
+
+order_cols <- paletteer_d("ggthemes::Tableau_20",
+                          length(unique(GenoTaxoInfo$Order)))
+
+order_cols <- as.character(order_cols)
+
+names(order_cols) <- sort(unique(GenoTaxoInfo$Order))
+
+# ----- Adding treatment/sample origin ----
+
+GGT2 <- GGT +
+  ggnewscale::new_scale_colour() +
+  geom_fruit(
+    geom = geom_point,
+    mapping = aes(shape = Treatment,
+                  color = Treatment),
+    size = 3,
+    offset = 0.02
+  ) +
+  scale_shape_manual(
+  values = c(saltwater  = 16,
+             freshwater = 17,
+             mucus      = 15),
+  name   = "Sample Origin"    
+) +
+scale_color_manual(
+  values = c(saltwater  = "forestgreen",
+             freshwater = "violet",
+             mucus      = "firebrick2"),
+  name   = "Sample Origin"    # must match shape name to keep merged
+)
+
+# ---- Creating Order Band ----
+
+GGT3 <- GGT2 +
+  ggnewscale::new_scale_fill() +
+  ggtreeExtra::geom_fruit(
+    geom = geom_tile,
+    mapping = aes(fill = Order),
+    width = 0.06,
+    offset = 0.1,
+    color = "white"
+  ) +
+  scale_fill_manual(
+    values = order_cols,
+    name = " Taxonomy (Order)"
+  )
+
+# ---- Adding Contig Info ----
+
+
+GGT4 <- GGT3 +
+  ggnewscale::new_scale_fill() +
+  geom_fruit(
+    geom    = geom_star,
+    mapping = aes(fill      = CircularMAG,
+                  starshape = CircularMAG),
+    offset  = 0.08,
+    size    = 4,
+    color   = NA
+  ) +
+  scale_fill_manual(
+    values       = c("Yes" = "black"),
+    name         = "Circular MAG",
+    na.translate = FALSE
+  ) +
+  scale_starshape_manual(
+    values       = c("Yes" = 29),
+    name         = "Circular MAG",
+    na.translate = FALSE
+  )
+
+# ---- Adding 16S rRNA presence ----
+
+GGTFinal <- GGT4 +
+  ggnewscale::new_scale_color() + 
+  geom_fruit(
+    geom    = geom_point,
+    mapping = aes(color = rRNA16S),
+    shape   = 18,
+    size    = 4,
+    offset  = 0.11
+  ) +
+  scale_color_manual(
+    values       = c("Present" = "black"),
+    na.translate = FALSE,
+    name         = "16S rRNA"
+  )
+
+
+# ---- With Labels ----
+
+GGTNames <- GGTFinal +
+  geom_tiplab(aes(label = Genus),
+              offset = 0.8,
+              size = 2.5)
+
+# ---- Adjusting Legend size ----
+
+GGTFinal <- GGTFinal +
+  theme(
+    legend.text     = element_text(size = 13),   
+    legend.title    = element_text(size = 15),   
+    legend.key.size = unit(1.2, "cm")            
+  )
+
+# ---- Save plots with and without text ----
+
+ggsave(GGTFinal,
+       file = paste0(OUT, "_tree.pdf"),
+       width = 14,
+       height = 14)
+
+ggsave(GGTNames,
+       file = paste0(OUT, "_tree_with_names.pdf"),
+       width = 14,
+       height = 14)
+
+
+
+```
+
+
+```{r Distillr and MCI plots}
+
+
+# ---- Combine DRAM annotations ---- 
+
+annotations_combined <- bind_rows(
+  read.table("salt_annotations.tsv",  sep="\t", header=TRUE, stringsAsFactors=FALSE, colClasses="character", fill=TRUE, quote = ""),
+  read.table("fresh_annotations.tsv", sep="\t", header=TRUE, stringsAsFactors=FALSE, colClasses="character", fill=TRUE, quote = ""),
+  read.table("mucus_annotations.tsv", sep="\t", header=TRUE, stringsAsFactors=FALSE, colClasses="character", fill=TRUE, quote = "")
+)
+
+colnames(annotations_combined)[1] <- ""
+
+write.table(annotations_combined, "annotations_combined.tsv", sep="\t", row.names=FALSE, quote=FALSE)
+
+# ---- Read the annotation from DRAM ----
+
+Annot <- read_tsv("annotations_combined.tsv") %>%
+  rename("GENE"=`...1`) %>%
+  rename("Genome"=fasta) %>%
+  select(GENE, Genome, ko_id, kegg_hit) %>%
+  mutate(
+    distill = ifelse(
+      grepl("\\[EC:", kegg_hit), # Check if kegg_hit contains [EC:
+      paste(ko_id, sub(".*(\\[EC:.*?])", "\\1", kegg_hit), sep = " "), # Combine ko_id and extracted EC number
+      ko_id # If no [EC:], keep only ko_id
+    )
+  ) %>%
+  select(Genome, distill) %>%
+  drop_na()
+
+# ---- Use distillR to obtain the GIFTS ----
+
+GIFTs <- distill(Annot,GIFT_db,genomecol=1,annotcol=2)
+
+
+# ---- Compute MCI and keep MAG as an ID ----
+mci_tbl <- GIFTs %>%
+  as.data.frame() %>%
+  mutate(MAG = rownames(.)) %>%
+  relocate(MAG) %>%
+  mutate(
+    MCI = rowMeans(select(., where(is.numeric)), na.rm = TRUE),
+    Condition = str_remove_all(MAG, "\\...*")
+  ) %>%
+  select(MAG, MCI, Condition)
+
+# ---- t-SNE input must be numeric only ----
+forTSNE <- mci_tbl %>%
+  select(MCI) %>%
+  as.matrix()
+
+# ---- Perplexity must be < (n - 1) / 3 ----
+n_samples <- nrow(forTSNE)
+perp <- min(30, floor((n_samples - 1) / 3))
+if (perp < 2) stop("Not enough samples for t-SNE; need at least 3 rows.")
+
+set.seed(123)
+tsne_func <- Rtsne(
+  X = forTSNE,
+  dims = 2,
+  perplexity = perp,
+  check_duplicates = FALSE
+)
+
+
+tsne_df <- as_tibble(tsne_func$Y) %>%
+  rename(tSNE1 = V1, tSNE2 = V2) %>%
+  mutate(MAG = mci_tbl$MAG, MCI = mci_tbl$MCI, Condition = mci_tbl$Condition) 
+
+tsne_df <- tsne_df %>%
+  left_join(
+    GenoTaxoInfo %>% dplyr::select(Bin_Id, Order, Genus),
+    by = c("MAG" = "Bin_Id")
+  )
+
+tsne_df <- tsne_df %>%
+  mutate(
+    Condition = factor(Condition,
+                       levels = c("mucus", "freshwater", "saltwater"))
+  )
+
+# ---- Create Order color palette ----
+order_cols_tsne <- paletteer_d("ggthemes::Tableau_20",
+                                length(unique(GenoTaxoInfo$Order)))
+order_cols_tsne <- as.character(order_cols_tsne)
+names(order_cols_tsne) <- sort(unique(GenoTaxoInfo$Order))
+
+# ---- MCI T-sne plot ----
+
+tsne_plot_mci <- tsne_df %>%
+  ggplot(aes(x     = tSNE1,
+             y     = tSNE2,       
+             shape = Condition)) +
+  geom_point(aes(fill = MCI),     
+             size   = 4) +
+  scale_shape_manual(
+    values = c("freshwater" = 24,
+               "mucus"      = 22,
+               "saltwater"  = 21),
+    labels = c("freshwater" = "Freshwater",
+             "mucus"      = "Mucus",
+             "saltwater"  = "Saltwater"),
+    name = "Sample Origin"
+  ) +
+  scale_fill_gradientn(
+    colours = viridis(18),
+    name    = "MCI"
+  ) +
+  theme_classic()
+
+ggsave(tsne_plot_mci,
+       file   = "tsne_mci_metabolic.pdf",
+       width  = 10,   
+       height = 7.5)
+
+# ---- Order T-sne plot ----
+
+tsne_plot_order <- tsne_df %>%
+  ggplot(aes(x     = tSNE1,
+             y     = tSNE2,        
+             shape = Condition)) +
+  geom_point(aes(fill = Order),      
+             size   = 4) +
+  scale_shape_manual(
+    values = c("freshwater" = 24,
+               "mucus"      = 22,
+               "saltwater"  = 21),
+    labels = c("freshwater" = "Freshwater",
+             "mucus"      = "Mucus",
+             "saltwater"  = "Saltwater"),
+    name = "Sample Origin"
+  ) +
+  scale_fill_manual(
+    values = order_cols_tsne,
+    name   = "Taxonomy (Order)"
+  ) + 
+  guides(
+    fill = guide_legend(
+      override.aes = list(shape = 21, color = NA)
+    )
+  ) +
+  theme_classic()
+
+ggsave(tsne_plot_order,
+       file   = "tsne_order_metabolic.pdf",
+       width  = 10, 
+       height = 7.5)
+
+
+```
+
